@@ -1,0 +1,1380 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
+
+# Set plotting style
+plt.style.use('ggplot')
+sns.set(style="whitegrid")
+
+# Function to load and process NHANES XPT files
+def load_nhanes_data(file_path):
+    """
+    Load NHANES XPT file and convert to pandas DataFrame
+    
+    Parameters:
+    file_path (str): Path to the XPT file
+    
+    Returns:
+    pandas.DataFrame: Loaded data
+    """
+    try:
+        data = pd.read_sas(file_path, format='xport')
+        print(f"Successfully loaded {file_path}")
+        # Print column names to help debugging
+        print(f"Columns in {file_path}: {', '.join(data.columns.tolist())}")
+        return data
+    except Exception as e:
+        print(f"Error loading {file_path}: {e}")
+        return None
+
+# Main analysis function
+def analyze_antacid_anticoagulant_interaction():
+    """
+    Analyze the interaction between antacids and anticoagulants using NHANES data
+    """
+    # Load ALL required datasets
+    print("Loading NHANES datasets...")
+    
+    # Prescription data
+    rx_data = load_nhanes_data('RXQ_RX_L.xpt')
+    
+    # Medication questionnaire data
+    med_data = load_nhanes_data('MCQ_L.xpt')
+    
+    # Demographics data
+    demo_data = load_nhanes_data('DEMO_L.xpt')
+    
+    # Complete Blood Count data
+    cbc_data = load_nhanes_data('CBC_L.xpt')
+    
+    # C-Reactive Protein data (inflammation marker)
+    crp_data = load_nhanes_data('HSCRP_L.xpt')
+    
+    # Additional datasets requested
+    diet_data = load_nhanes_data('DBQ_L.xpt')
+    hdl_data = load_nhanes_data('hdl_L.xpt')
+    ferritin_data = load_nhanes_data('fertin_l.xpt')
+    rbc_folate_data = load_nhanes_data('folate_l.xpt')
+    vit_d_data = load_nhanes_data('VID_L.xpt')
+    folate_forms_data = load_nhanes_data('FOLFMS_L.xpt')
+    
+    # Check if required datasets were loaded successfully
+    required_datasets = [rx_data, med_data, demo_data, cbc_data, crp_data]
+    if any(data is None for data in required_datasets):
+        print("Error: One or more required datasets could not be loaded.")
+        return
+    
+    print("\nDataset Information:")
+    print(f"Prescription data: {rx_data.shape[0]} records, {rx_data.shape[1]} variables")
+    print(f"Medication data: {med_data.shape[0]} records, {med_data.shape[1]} variables")
+    print(f"Demographics data: {demo_data.shape[0]} records, {demo_data.shape[1]} variables")
+    print(f"CBC data: {cbc_data.shape[0]} records, {cbc_data.shape[1]} variables")
+    
+    # Step 1: Identify participants taking antacids and anticoagulants
+    print("\nStep 1: Identifying medication use...")
+    
+    # Create lists of common antacids and anticoagulants (by generic name, partial matches)
+    antacids = ['MAALOX', 'TUMS', 'ROLAIDS', 'MYLANTA', 'PEPCID', 'ZANTAC', 'PRILOSEC', 
+                'NEXIUM', 'PREVACID', 'PROTONIX', 'OMEPRAZOLE', 'ESOMEPRAZOLE', 
+                'LANSOPRAZOLE', 'PANTOPRAZOLE', 'RABEPRAZOLE', 'DEXLANSOPRAZOLE',
+                'FAMOTIDINE', 'RANITIDINE', 'CIMETIDINE', 'NIZATIDINE', 'CALCIUM CARBONATE',
+                'ALUMINUM HYDROXIDE', 'MAGNESIUM HYDROXIDE', 'SODIUM BICARBONATE']
+    
+    anticoagulants = ['WARFARIN', 'COUMADIN', 'JANTOVEN', 'HEPARIN', 'ENOXAPARIN', 'LOVENOX',
+                       'FONDAPARINUX', 'ARIXTRA', 'DABIGATRAN', 'PRADAXA', 'RIVAROXABAN',
+                       'XARELTO', 'APIXABAN', 'ELIQUIS', 'EDOXABAN', 'SAVAYSA', 'BETRIXABAN',
+                       'BEVYXXA', 'DALTEPARIN', 'FRAGMIN', 'TINZAPARIN', 'INNOHEP']
+    
+    # Function to check if a medication belongs to a specific class
+    def is_medication_in_class(medication, med_class):
+        if isinstance(medication, str):
+            return any(med.lower() in medication.lower() for med in med_class)
+        return False
+    
+    # Print all available columns in rx_data to identify the correct medication ID column
+    print("Available columns in prescription data:")
+    print(rx_data.columns.tolist())
+    
+    # Try to find the correct medication identifier column
+    if 'RXDDRGID' in rx_data.columns:
+        med_id_col = 'RXDDRGID'
+    elif 'RXDDRUG' in rx_data.columns:
+        med_id_col = 'RXDDRUG'
+    elif 'RXDRUGID' in rx_data.columns:
+        med_id_col = 'RXDRUGID'
+    elif 'RXDRUG' in rx_data.columns:
+        med_id_col = 'RXDRUG'
+    else:
+        # If none of the common column names exist, look for columns that might contain medication names
+        possible_med_cols = [col for col in rx_data.columns if 'RX' in col and ('DRUG' in col or 'DRG' in col or 'MED' in col)]
+        
+        if possible_med_cols:
+            med_id_col = possible_med_cols[0]
+            print(f"Using {med_id_col} as the medication identifier column")
+        else:
+            print("Could not find a suitable medication identifier column. Printing sample data:")
+            print(rx_data.head())
+            # Look for any text columns that might contain medication info
+            text_cols = rx_data.select_dtypes(include=['object']).columns.tolist()
+            if text_cols:
+                med_id_col = text_cols[0]
+                print(f"Trying first text column: {med_id_col}")
+            else:
+                print("No suitable column found for medication identification")
+                return
+    
+    print(f"Using column '{med_id_col}' for medication identification")
+    
+    # Create flags for antacid and anticoagulant use in the prescription data
+    rx_data['ANTACID_FLAG'] = rx_data[med_id_col].apply(lambda x: is_medication_in_class(x, antacids))
+    rx_data['ANTICOAG_FLAG'] = rx_data[med_id_col].apply(lambda x: is_medication_in_class(x, anticoagulants))
+    
+    # Aggregate to participant level to identify users of each medication class
+    participants_with_meds = rx_data.groupby('SEQN').agg({
+        'ANTACID_FLAG': 'any',
+        'ANTICOAG_FLAG': 'any'
+    }).reset_index()
+    
+    print(f"Participants taking antacids: {participants_with_meds['ANTACID_FLAG'].sum()}")
+    print(f"Participants taking anticoagulants: {participants_with_meds['ANTICOAG_FLAG'].sum()}")
+    print(f"Participants taking both: {(participants_with_meds['ANTACID_FLAG'] & participants_with_meds['ANTICOAG_FLAG']).sum()}")
+    
+    # Chi-Square Test of Association
+    contingency_table = pd.crosstab(participants_with_meds['ANTACID_FLAG'], 
+                                  participants_with_meds['ANTICOAG_FLAG'])
+    chi2, p, dof, expected = stats.chi2_contingency(contingency_table)
+    print(f"\nChi-square test for association between antacid and anticoagulant use:")
+    print(f"Chi-square value: {chi2:.4f}")
+    print(f"p-value: {p:.4f}")
+    print(f"Degrees of freedom: {dof}")
+    print("Contingency table:")
+    print(contingency_table)
+    
+    # Step 2: Merge datasets
+    print("\nStep 2: Merging datasets...")
+    
+    # Merge medication flags with demographic data
+    merged_data = pd.merge(participants_with_meds, demo_data, on='SEQN', how='inner')
+    
+    # Merge with CBC data (blood markers)
+    merged_data = pd.merge(merged_data, cbc_data, on='SEQN', how='inner')
+    
+    # Merge with CRP data (inflammation marker)
+    merged_data = pd.merge(merged_data, crp_data, on='SEQN', how='inner')
+    
+    # Merge additional datasets
+    # Only merge datasets that were successfully loaded
+    if diet_data is not None:
+        merged_data = pd.merge(merged_data, diet_data, on='SEQN', how='left')
+    if hdl_data is not None:
+        merged_data = pd.merge(merged_data, hdl_data, on='SEQN', how='left')
+    if ferritin_data is not None:
+        merged_data = pd.merge(merged_data, ferritin_data, on='SEQN', how='left')
+    if rbc_folate_data is not None:
+        merged_data = pd.merge(merged_data, rbc_folate_data, on='SEQN', how='left')
+    if vit_d_data is not None:
+        merged_data = pd.merge(merged_data, vit_d_data, on='SEQN', how='left')
+    if folate_forms_data is not None:
+        merged_data = pd.merge(merged_data, folate_forms_data, on='SEQN', how='left')
+    
+    print(f"Final merged dataset: {merged_data.shape[0]} participants, {merged_data.shape[1]} variables")
+    
+    # Step 3: Data cleaning and preprocessing
+    print("\nStep 3: Cleaning and preprocessing data...")
+    
+    # Select relevant variables
+    # For demographics: age, gender, race, education
+    # For lab values: RBC, HGB, HCT, PLT, and CRP
+    # For coagulation markers: Look for INR, PT, aPTT columns
+    
+    # First check if these columns exist in the merged data
+    expected_cols = ['SEQN', 'ANTACID_FLAG', 'ANTICOAG_FLAG', 
+                     'RIDAGEYR', 'RIAGENDR', 'RIDRETH1', 'DMDEDUC2',
+                     'LBXRBCSI', 'LBXHGB', 'LBXHCT', 'LBXPLTSI', 'LBXSCRP']
+    
+    # Look for coagulation markers
+    coag_markers = [col for col in merged_data.columns if any(marker in col.upper() for marker in ['INR', 'PT', 'APTT', 'PTT'])]
+    if coag_markers:
+        print(f"Found coagulation markers: {coag_markers}")
+        expected_cols.extend(coag_markers)
+    else:
+        print("Warning: No coagulation markers (INR, PT, aPTT) found in dataset")
+    
+    # Verify column existence and get alternative column names if needed
+    cols_to_keep = ['SEQN', 'ANTACID_FLAG', 'ANTICOAG_FLAG']
+    
+    # Check demographic columns
+    demo_map = {
+        'RIDAGEYR': 'AGE',
+        'RIAGENDR': 'GENDER',
+        'RIDRETH1': 'RACE',
+        'DMDEDUC2': 'EDUCATION'
+    }
+    
+    for old_col, new_col in demo_map.items():
+        if old_col in merged_data.columns:
+            cols_to_keep.append(old_col)
+        else:
+            print(f"Warning: {old_col} not found in demographic data")
+            # Look for alternative columns
+            if old_col == 'RIDAGEYR':
+                alt_cols = [col for col in merged_data.columns if 'AGE' in col]
+            elif old_col == 'RIAGENDR':
+                alt_cols = [col for col in merged_data.columns if 'GEND' in col]
+            elif old_col == 'RIDRETH1':
+                alt_cols = [col for col in merged_data.columns if 'ETH' in col or 'RACE' in col]
+            elif old_col == 'DMDEDUC2':
+                alt_cols = [col for col in merged_data.columns if 'EDUC' in col]
+            else:
+                alt_cols = []
+                
+            if alt_cols:
+                print(f"Using alternative column: {alt_cols[0]}")
+                cols_to_keep.append(alt_cols[0])
+                demo_map[old_col] = alt_cols[0]  # Update mapping
+    
+    # Check lab value columns
+    lab_map = {
+        'LBXRBCSI': 'RBC',
+        'LBXHGB': 'HEMOGLOBIN',
+        'LBXHCT': 'HEMATOCRIT',
+        'LBXPLTSI': 'PLATELETS',
+        'LBXSCRP': 'CRP'
+    }
+    
+    # Add any coagulation markers to lab map
+    for marker in coag_markers:
+        if 'INR' in marker.upper():
+            lab_map[marker] = 'INR'
+        elif 'PT' in marker.upper():
+            lab_map[marker] = 'PT'
+        elif 'APTT' in marker.upper() or 'PTT' in marker.upper():
+            lab_map[marker] = 'APTT'
+    
+    for old_col, new_col in lab_map.items():
+        if old_col in merged_data.columns:
+            cols_to_keep.append(old_col)
+        else:
+            print(f"Warning: {old_col} not found in lab data")
+            # Look for alternative columns
+            if old_col == 'LBXRBCSI':
+                alt_cols = [col for col in merged_data.columns if 'RBC' in col]
+            elif old_col == 'LBXHGB':
+                alt_cols = [col for col in merged_data.columns if 'HGB' in col or 'HEMO' in col]
+            elif old_col == 'LBXHCT':
+                alt_cols = [col for col in merged_data.columns if 'HCT' in col]
+            elif old_col == 'LBXPLTSI':
+                alt_cols = [col for col in merged_data.columns if 'PLT' in col]
+            elif old_col == 'LBXSCRP':
+                alt_cols = [col for col in merged_data.columns if 'CRP' in col]
+            else:
+                alt_cols = []
+                
+            if alt_cols:
+                print(f"Using alternative column: {alt_cols[0]}")
+                cols_to_keep.append(alt_cols[0])
+                lab_map[old_col] = alt_cols[0]  # Update mapping
+    
+    # Add additional columns that might be relevant (vitamin levels, etc.)
+    # Look for vitamin D, folate, ferritin columns
+    vitamin_cols = [col for col in merged_data.columns if any(vit in col.upper() 
+                                                             for vit in ['VIT', 'FOLATE', 'FERR'])]
+    if vitamin_cols:
+        print(f"Found vitamin/nutrient markers: {vitamin_cols}")
+        cols_to_keep.extend(vitamin_cols)
+    
+    # Keep only necessary columns
+    print(f"Using these columns for analysis: {cols_to_keep}")
+    analysis_data = merged_data[cols_to_keep].copy()
+    
+    # Update column names in analysis_data based on the mappings
+    rename_dict = {}
+    for old_col, new_col in {**demo_map, **lab_map}.items():
+        if old_col in analysis_data.columns:
+            rename_dict[old_col] = new_col
+    
+    # Rename columns for clarity
+    analysis_data = analysis_data.rename(columns=rename_dict)
+    
+    # Check for missing values
+    missing_values = analysis_data.isnull().sum()
+    print("Missing values in each column:")
+    print(missing_values)
+    
+    # Get the new column names for lab values after renaming
+    lab_cols = [rename_dict.get(col, col) for col in lab_map.values()]
+    
+    # Drop rows with missing values in key lab measurements
+    # Make sure we use the correct column names
+    valid_lab_cols = [col for col in lab_cols if col in analysis_data.columns]
+    analysis_data = analysis_data.dropna(subset=valid_lab_cols)
+    print(f"Data after handling missing values: {analysis_data.shape[0]} participants")
+    
+    # Convert categorical variables to numeric
+    gender_col = rename_dict.get('RIAGENDR', 'GENDER')
+    if gender_col in analysis_data.columns:
+        analysis_data[gender_col] = analysis_data[gender_col].map({1: 'Male', 2: 'Female'})
+    
+    # Map race/ethnicity codes
+    race_col = rename_dict.get('RIDRETH1', 'RACE')
+    if race_col in analysis_data.columns:
+        race_map = {1: 'Mexican American', 2: 'Other Hispanic', 3: 'Non-Hispanic White',
+                    4: 'Non-Hispanic Black', 5: 'Other Race'}
+        analysis_data[race_col] = analysis_data[race_col].map(race_map)
+    
+    # Create dummy variables for categorical variables
+    cat_cols = [col for col in [gender_col, race_col] if col in analysis_data.columns]
+    if cat_cols:
+        analysis_data = pd.get_dummies(analysis_data, columns=cat_cols, drop_first=True)
+    
+    # Step 4: Exploratory Data Analysis
+    print("\nStep 4: Conducting exploratory data analysis...")
+    
+    # Create groups for analysis
+    analysis_data['GROUP'] = 'Neither'
+    analysis_data.loc[analysis_data['ANTACID_FLAG'] & ~analysis_data['ANTICOAG_FLAG'], 'GROUP'] = 'Antacid Only'
+    analysis_data.loc[~analysis_data['ANTACID_FLAG'] & analysis_data['ANTICOAG_FLAG'], 'GROUP'] = 'Anticoagulant Only'
+    analysis_data.loc[analysis_data['ANTACID_FLAG'] & analysis_data['ANTICOAG_FLAG'], 'GROUP'] = 'Both'
+    
+    # Group counts
+    group_counts = analysis_data['GROUP'].value_counts()
+    print("Distribution by medication group:")
+    print(group_counts)
+    
+    # Create visualization of participant groups
+    plt.figure(figsize=(10, 6))
+    sns.countplot(x='GROUP', data=analysis_data, palette='viridis')
+    plt.title('Distribution of Participants by Medication Use')
+    plt.xlabel('Medication Group')
+    plt.ylabel('Number of Participants')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig('medication_groups.png')
+    print("Created medication groups visualization (medication_groups.png)")
+    
+    # Calculate prevalence of medication use in the population
+    total_participants = len(analysis_data)
+    antacid_prevalence = analysis_data['ANTACID_FLAG'].sum() / total_participants * 100
+    anticoag_prevalence = analysis_data['ANTICOAG_FLAG'].sum() / total_participants * 100
+    both_prevalence = ((analysis_data['ANTACID_FLAG'] & analysis_data['ANTICOAG_FLAG']).sum() 
+                      / total_participants * 100)
+    
+    print("\nPrevalence of medication use in study population:")
+    print(f"Antacid use: {antacid_prevalence:.2f}%")
+    print(f"Anticoagulant use: {anticoag_prevalence:.2f}%")
+    print(f"Both medications: {both_prevalence:.2f}%")
+    
+    # Analyze blood markers
+    # Get blood marker columns after renaming
+    blood_markers = [col for col in ['HEMOGLOBIN', 'HEMATOCRIT', 'PLATELETS', 'CRP', 'INR', 'PT', 'APTT'] 
+                    if col in analysis_data.columns]
+    
+    # Create detailed summaries by group
+    print("\nSummary statistics by medication group:")
+    for group in group_counts.index:
+        group_data = analysis_data[analysis_data['GROUP'] == group]
+        print(f"\n{group} group (n={len(group_data)}):")
+        for marker in blood_markers:
+            if marker in analysis_data.columns:
+                marker_stats = group_data[marker].describe()
+                print(f"{marker}: Mean={marker_stats['mean']:.2f}, SD={marker_stats['std']:.2f}, "
+                     f"Min={marker_stats['min']:.2f}, Max={marker_stats['max']:.2f}")
+    
+    # Create visualizations for each blood marker
+    for marker in blood_markers:
+        if marker in analysis_data.columns:
+            # Box plot
+            plt.figure(figsize=(10, 6))
+            sns.boxplot(x='GROUP', y=marker, data=analysis_data, palette='viridis')
+            plt.title(f'{marker} by Medication Group')
+            plt.xlabel('Medication Group')
+            plt.ylabel(marker)
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            plt.savefig(f'{marker}_by_group_boxplot.png')
+            print(f"Created boxplot for {marker} (saved as {marker}_by_group_boxplot.png)")
+            
+            # Histograms by group
+            plt.figure(figsize=(12, 8))
+            for i, group in enumerate(group_counts.index):
+                plt.subplot(2, 2, i+1)
+                group_data = analysis_data[analysis_data['GROUP'] == group]
+                sns.histplot(group_data[marker].dropna(), kde=True)
+                plt.title(f'{marker} Distribution - {group}')
+                plt.xlabel(marker)
+                plt.ylabel('Count')
+            plt.tight_layout()
+            plt.savefig(f'{marker}_distribution_by_group.png')
+            print(f"Created distribution plots for {marker} (saved as {marker}_distribution_by_group.png)")
+            
+            # ANOVA to test for significant differences
+            groups = [analysis_data[analysis_data['GROUP'] == group][marker].dropna() 
+                     for group in group_counts.index]
+            # Make sure we have data in each group
+            if all(len(g) > 0 for g in groups):
+                f_stat, p_val = stats.f_oneway(*groups)
+                print(f"\nANOVA for {marker}:")
+                print(f"F-statistic: {f_stat:.4f}, p-value: {p_val:.4f}")
+                
+                if p_val < 0.05:
+                    print(f"Significant difference found in {marker} levels between groups")
+                    
+                    # Post-hoc t-tests to identify which groups differ
+                    print("Post-hoc t-tests:")
+                    group_list = list(group_counts.index)
+                    for i in range(len(group_list)):
+                        for j in range(i+1, len(group_list)):
+                            group1 = group_list[i]
+                            group2 = group_list[j]
+                            group1_data = analysis_data[analysis_data['GROUP'] == group1][marker].dropna()
+                            group2_data = analysis_data[analysis_data['GROUP'] == group2][marker].dropna()
+                            if len(group1_data) > 0 and len(group2_data) > 0:
+                                t_stat, p_val_t = stats.ttest_ind(
+                                    group1_data,
+                                    group2_data,
+                                    equal_var=False
+                                )
+                                print(f"{group1} vs {group2}: t-stat={t_stat:.4f}, p-value={p_val_t:.4f}")
+            else:
+                print(f"Warning: Insufficient data for ANOVA on {marker}")
+    
+    # Step 5: Regression analysis (if we have enough data and columns)
+    age_col = rename_dict.get('RIDAGEYR', 'AGE')
+    
+    print("\nStep 5: Conducting regression analysis...")
+    
+    # Check if we have INR or other coagulation markers
+    coag_markers_present = [marker for marker in ['INR', 'PT', 'APTT'] if marker in analysis_data.columns]
+    
+    if coag_markers_present:
+        print(f"Running regression models for coagulation markers: {coag_markers_present}")
+        
+        # OLS regression models for each coagulation marker
+        for marker in coag_markers_present:
+            # Create model formula with interaction term
+            formula = f"{marker} ~ ANTACID_FLAG + ANTICOAG_FLAG + ANTACID_FLAG:ANTICOAG_FLAG"
+            
+            # Add age if available
+            if age_col in analysis_data.columns:
+                formula += f" + {age_col}"
+            
+            # Add gender and race variables to formula if available
+            gender_cols = [col for col in analysis_data.columns if gender_col in col and col != gender_col]
+            race_cols = [col for col in analysis_data.columns if race_col in col and col != race_col]
+            
+            for col in gender_cols + race_cols:
+                formula += f" + {col}"
+            
+            try:
+                # Fit the model
+                model = ols(formula, data=analysis_data).fit()
+                
+                # Print summary
+                print(f"\nRegression results for {marker}:")
+                print(model.summary().tables[1])
+                
+                # Check for interaction effect
+                if 'ANTACID_FLAG:ANTICOAG_FLAG' in model.params:
+                    interaction_pval = model.pvalues.get('ANTACID_FLAG:ANTICOAG_FLAG')
+                    interaction_coef = model.params.get('ANTACID_FLAG:ANTICOAG_FLAG')
+                    
+                    if interaction_pval and interaction_pval < 0.05:
+                        print(f"Significant interaction effect found for {marker}:")
+                        print(f"Coefficient: {interaction_coef:.4f}, p-value: {interaction_pval:.4f}")
+                        print("This suggests antacids may alter anticoagulant effectiveness.")
+                    else:
+                        print(f"No significant interaction effect for {marker} (p={interaction_pval:.4f})")
+                else:
+                    print("Interaction term not in model")
+                    
+                # Create prediction grid for visualization
+                if age_col in analysis_data.columns:
+                    mean_age = analysis_data[age_col].mean()
+                    pred_data = pd.DataFrame({
+                        'ANTACID_FLAG': [False, False, True, True],
+                        'ANTICOAG_FLAG': [False, True, False, True],
+                        age_col: [mean_age, mean_age, mean_age, mean_age]
+                    })
+                    
+                    # Add dummy columns for categorical variables
+                    for col in gender_cols + race_cols:
+                        pred_data[col] = analysis_data[col].mode()[0]
+                    
+                    # Get predictions
+                    pred_data['predicted'] = model.predict(pred_data)
+                    
+                    # Create visualization
+                    plt.figure(figsize=(10, 6))
+                    sns.barplot(x='ANTICOAG_FLAG', y='predicted', hue='ANTACID_FLAG', data=pred_data)
+                    plt.title(f'Predicted {marker} by Medication Use')
+                    plt.xlabel('Anticoagulant Use')
+                    plt.ylabel(f'Predicted {marker}')
+                    plt.xticks([0, 1], ['No', 'Yes'])
+                    plt.legend(title='Antacid Use', labels=['No', 'Yes'])
+                    plt.tight_layout()
+                    plt.savefig(f'{marker}_prediction.png')
+                    print(f"Created prediction plot for {marker} (saved as {marker}_prediction.png)")
+            except Exception as e:
+                print(f"Error in regression for {marker}: {e}")
+    else:
+        print("No coagulation markers (INR, PT, APTT) found in dataset. Using other blood markers instead.")
+        
+        # If no coagulation markers, use general blood markers
+        for marker in ['PLATELETS', 'HEMOGLOBIN', 'HEMATOCRIT']:
+            if marker in analysis_data.columns:
+                try:
+                    # Create formula
+                    formula = f"{marker} ~ ANTACID_FLAG + ANTICOAG_FLAG + ANTACID_FLAG:ANTICOAG_FLAG"
+                    if age_col in analysis_data.columns:
+                        formula += f" + {age_col}"
+                    
+                    # Add gender and race variables to formula if available
+                    gender_cols = [col for col in analysis_data.columns if gender_col in col and col != gender_col]
+                    race_cols = [col for col in analysis_data.columns if race_col in col and col != race_col]
+                    
+                    for col in gender_cols + race_cols:
+                        formula += f" + {col}"
+                    
+                    # Fit model
+                    model = ols(formula, data=analysis_data).fit()
+                    print(f"\nRegression results for {marker} (proxy for coagulation):")
+                    print(model.summary().tables[1])
+                    
+                    # Check interaction term
+                    if 'ANTACID_FLAG:ANTICOAG_FLAG' in model.params:
+                        interaction_pval = model.pvalues.get('ANTACID_FLAG:ANTICOAG_FLAG')
+                        interaction_coef = model.params.get('ANTACelse:
+        # If none of the common column names exist, look for columns that might contain medication names
+        possible_med_cols = [col for col in rx_data.columns if 'RX' in col and ('DRUG' in col or 'DRG' in col or 'MED' in col)]
+        
+        if possible_med_cols:
+            med_id_col = possible_med_cols[0]
+            print(f"Using {med_id_col} as the medication identifier column")
+        else:
+            print("Could not find a suitable medication identifier column. Printing sample data:")
+            print(rx_data.head())
+            # Look for any text columns that might contain medication info
+            text_cols = rx_data.select_dtypes(include=['object']).columns.tolist()
+            if text_cols:
+                med_id_col = text_cols[0]
+                print(f"Trying first text column: {med_id_col}")
+            else:
+                print("No suitable column found for medication identification")
+                return
+    
+    print(f"Using column '{med_id_col}' for medication identification")
+    
+    # Create flags for antacid and anticoagulant use in the prescription data
+    rx_data['ANTACID_FLAG'] = rx_data[med_id_col].apply(lambda x: is_medication_in_class(x, antacids))
+    rx_data['ANTICOAG_FLAG'] = rx_data[med_id_col].apply(lambda x: is_medication_in_class(x, anticoagulants))
+    
+    # Aggregate to participant level to identify users of each medication class
+    participants_with_meds = rx_data.groupby('SEQN').agg({
+        'ANTACID_FLAG': 'any',
+        'ANTICOAG_FLAG': 'any'
+    }).reset_index()
+    
+    print(f"Participants taking antacids: {participants_with_meds['ANTACID_FLAG'].sum()}")
+    print(f"Participants taking anticoagulants: {participants_with_meds['ANTICOAG_FLAG'].sum()}")
+    print(f"Participants taking both: {(participants_with_meds['ANTACID_FLAG'] & participants_with_meds['ANTICOAG_FLAG']).sum()}")
+    
+    # Chi-Square Test of Association
+    contingency_table = pd.crosstab(participants_with_meds['ANTACID_FLAG'], 
+                                  participants_with_meds['ANTICOAG_FLAG'])
+    chi2, p, dof, expected = stats.chi2_contingency(contingency_table)
+    print(f"\nChi-square test for association between antacid and anticoagulant use:")
+    print(f"Chi-square value: {chi2:.4f}")
+    print(f"p-value: {p:.4f}")
+    print(f"Degrees of freedom: {dof}")
+    print("Contingency table:")
+    print(contingency_table)
+    
+    # Step 2: Merge datasets
+    print("\nStep 2: Merging datasets...")
+    
+    # Merge medication flags with demographic data
+    merged_data = pd.merge(participants_with_meds, demo_data, on='SEQN', how='inner')
+    
+    # Merge with CBC data (blood markers)
+    merged_data = pd.merge(merged_data, cbc_data, on='SEQN', how='inner')
+    
+    # Merge with CRP data (inflammation marker)
+    merged_data = pd.merge(merged_data, crp_data, on='SEQN', how='inner')
+    
+    # Merge additional datasets
+    # Only merge datasets that were successfully loaded
+    if diet_data is not None:
+        merged_data = pd.merge(merged_data, diet_data, on='SEQN', how='left')
+    if hdl_data is not None:
+        merged_data = pd.merge(merged_data, hdl_data, on='SEQN', how='left')
+    if ferritin_data is not None:
+        merged_data = pd.merge(merged_data, ferritin_data, on='SEQN', how='left')
+    if rbc_folate_data is not None:
+        merged_data = pd.merge(merged_data, rbc_folate_data, on='SEQN', how='left')
+    if vit_d_data is not None:
+        merged_data = pd.merge(merged_data, vit_d_data, on='SEQN', how='left')
+    if folate_forms_data is not None:
+        merged_data = pd.merge(merged_data, folate_forms_data, on='SEQN', how='left')
+    
+    print(f"Final merged dataset: {merged_data.shape[0]} participants, {merged_data.shape[1]} variables")
+    
+    # Step 3: Data cleaning and preprocessing
+    print("\nStep 3: Cleaning and preprocessing data...")
+    
+    # Select relevant variables
+    # For demographics: age, gender, race, education
+    # For lab values: RBC, HGB, HCT, PLT, and CRP
+    # For coagulation markers: Look for INR, PT, aPTT columns
+    
+    # First check if these columns exist in the merged data
+    expected_cols = ['SEQN', 'ANTACID_FLAG', 'ANTICOAG_FLAG', 
+                     'RIDAGEYR', 'RIAGENDR', 'RIDRETH1', 'DMDEDUC2',
+                     'LBXRBCSI', 'LBXHGB', 'LBXHCT', 'LBXPLTSI', 'LBXSCRP']
+    
+    # Look for coagulation markers
+    coag_markers = [col for col in merged_data.columns if any(marker in col.upper() for marker in ['INR', 'PT', 'APTT', 'PTT'])]
+    if coag_markers:
+        print(f"Found coagulation markers: {coag_markers}")
+        expected_cols.extend(coag_markers)
+    else:
+        print("Warning: No coagulation markers (INR, PT, aPTT) found in dataset")
+    
+    # Verify column existence and get alternative column names if needed
+    cols_to_keep = ['SEQN', 'ANTACID_FLAG', 'ANTICOAG_FLAG']
+    
+    # Check demographic columns
+    demo_map = {
+        'RIDAGEYR': 'AGE',
+        'RIAGENDR': 'GENDER',
+        'RIDRETH1': 'RACE',
+        'DMDEDUC2': 'EDUCATION'
+    }
+    
+    for old_col, new_col in demo_map.items():
+        if old_col in merged_data.columns:
+            cols_to_keep.append(old_col)
+        else:
+            print(f"Warning: {old_col} not found in demographic data")
+            # Look for alternative columns
+            if old_col == 'RIDAGEYR':
+                alt_cols = [col for col in merged_data.columns if 'AGE' in col]
+            elif old_col == 'RIAGENDR':
+                alt_cols = [col for col in merged_data.columns if 'GEND' in col]
+            elif old_col == 'RIDRETH1':
+                alt_cols = [col for col in merged_data.columns if 'ETH' in col or 'RACE' in col]
+            elif old_col == 'DMDEDUC2':
+                alt_cols = [col for col in merged_data.columns if 'EDUC' in col]
+            else:
+                alt_cols = []
+                
+            if alt_cols:
+                print(f"Using alternative column: {alt_cols[0]}")
+                cols_to_keep.append(alt_cols[0])
+                demo_map[old_col] = alt_cols[0]  # Update mapping
+    
+    # Check lab value columns
+    lab_map = {
+        'LBXRBCSI': 'RBC',
+        'LBXHGB': 'HEMOGLOBIN',
+        'LBXHCT': 'HEMATOCRIT',
+        'LBXPLTSI': 'PLATELETS',
+        'LBXSCRP': 'CRP'
+    }
+    
+    # Add any coagulation markers to lab map
+    for marker in coag_markers:
+        if 'INR' in marker.upper():
+            lab_map[marker] = 'INR'
+        elif 'PT' in marker.upper():
+            lab_map[marker] = 'PT'
+        elif 'APTT' in marker.upper() or 'PTT' in marker.upper():
+            lab_map[marker] = 'APTT'
+    
+    for old_col, new_col in lab_map.items():
+        if old_col in merged_data.columns:
+            cols_to_keep.append(old_col)
+        else:
+            print(f"Warning: {old_col} not found in lab data")
+            # Look for alternative columns
+            if old_col == 'LBXRBCSI':
+                alt_cols = [col for col in merged_data.columns if 'RBC' in col]
+            elif old_col == 'LBXHGB':
+                alt_cols = [col for col in merged_data.columns if 'HGB' in col or 'HEMO' in col]
+            elif old_col == 'LBXHCT':
+                alt_cols = [col for col in merged_data.columns if 'HCT' in col]
+            elif old_col == 'LBXPLTSI':
+                alt_cols = [col for col in merged_data.columns if 'PLT' in col]
+            elif old_col == 'LBXSCRP':
+                alt_cols = [col for col in merged_data.columns if 'CRP' in col]
+            else:
+                alt_cols = []
+                
+            if alt_cols:
+                print(f"Using alternative column: {alt_cols[0]}")
+                cols_to_keep.append(alt_cols[0])
+                lab_map[old_col] = alt_cols[0]  # Update mapping
+    
+    # Add additional columns that might be relevant (vitamin levels, etc.)
+    # Look for vitamin D, folate, ferritin columns
+    vitamin_cols = [col for col in merged_data.columns if any(vit in col.upper() 
+                                                             for vit in ['VIT', 'FOLATE', 'FERR'])]
+    if vitamin_cols:
+        print(f"Found vitamin/nutrient markers: {vitamin_cols}")
+        cols_to_keep.extend(vitamin_cols)
+    
+    # Keep only necessary columns
+    print(f"Using these columns for analysis: {cols_to_keep}")
+    analysis_data = merged_data[cols_to_keep].copy()
+    
+    # Update column names in analysis_data based on the mappings
+    rename_dict = {}
+    for old_col, new_col in {**demo_map, **lab_map}.items():
+        if old_col in analysis_data.columns:
+            rename_dict[old_col] = new_col
+    
+    # Rename columns for clarity
+    analysis_data = analysis_data.rename(columns=rename_dict)
+    
+    # Check for missing values
+    missing_values = analysis_data.isnull().sum()
+    print("Missing values in each column:")
+    print(missing_values)
+    
+    # Get the new column names for lab values after renaming
+    lab_cols = [rename_dict.get(col, col) for col in lab_map.values()]
+    
+    # Drop rows with missing values in key lab measurements
+    # Make sure we use the correct column names
+    valid_lab_cols = [col for col in lab_cols if col in analysis_data.columns]
+    analysis_data = analysis_data.dropna(subset=valid_lab_cols)
+    print(f"Data after handling missing values: {analysis_data.shape[0]} participants")
+    
+    # Convert categorical variables to numeric
+    gender_col = rename_dict.get('RIAGENDR', 'GENDER')
+    if gender_col in analysis_data.columns:
+        analysis_data[gender_col] = analysis_data[gender_col].map({1: 'Male', 2: 'Female'})
+    
+    # Map race/ethnicity codes
+    race_col = rename_dict.get('RIDRETH1', 'RACE')
+    if race_col in analysis_data.columns:
+        race_map = {1: 'Mexican American', 2: 'Other Hispanic', 3: 'Non-Hispanic White',
+                    4: 'Non-Hispanic Black', 5: 'Other Race'}
+        analysis_data[race_col] = analysis_data[race_col].map(race_map)
+    
+    # Create dummy variables for categorical variables
+    cat_cols = [col for col in [gender_col, race_col] if col in analysis_data.columns]
+    if cat_cols:
+        analysis_data = pd.get_dummies(analysis_data, columns=cat_cols, drop_first=True)
+    
+    # Step 4: Exploratory Data Analysis
+    print("\nStep 4: Conducting exploratory data analysis...")
+    
+    # Create groups for analysis
+    analysis_data['GROUP'] = 'Neither'
+    analysis_data.loc[analysis_data['ANTACID_FLAG'] & ~analysis_data['ANTICOAG_FLAG'], 'GROUP'] = 'Antacid Only'
+    analysis_data.loc[~analysis_data['ANTACID_FLAG'] & analysis_data['ANTICOAG_FLAG'], 'GROUP'] = 'Anticoagulant Only'
+    analysis_data.loc[analysis_data['ANTACID_FLAG'] & analysis_data['ANTICOAG_FLAG'], 'GROUP'] = 'Both'
+    
+    # Group counts
+    group_counts = analysis_data['GROUP'].value_counts()
+    print("Distribution by medication group:")
+    print(group_counts)
+    
+    # Create visualization of participant groups
+    plt.figure(figsize=(10, 6))
+    sns.countplot(x='GROUP', data=analysis_data, palette='viridis')
+    plt.title('Distribution of Participants by Medication Use')
+    plt.xlabel('Medication Group')
+    plt.ylabel('Number of Participants')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig('medication_groups.png')
+    print("Created medication groups visualization (medication_groups.png)")
+    
+    # Calculate prevalence of medication use in the population
+    total_participants = len(analysis_data)
+    antacid_prevalence = analysis_data['ANTACID_FLAG'].sum() / total_participants * 100
+    anticoag_prevalence = analysis_data['ANTICOAG_FLAG'].sum() / total_participants * 100
+    both_prevalence = ((analysis_data['ANTACID_FLAG'] & analysis_data['ANTICOAG_FLAG']).sum() 
+                      / total_participants * 100)
+    
+    print("\nPrevalence of medication use in study population:")
+    print(f"Antacid use: {antacid_prevalence:.2f}%")
+    print(f"Anticoagulant use: {anticoag_prevalence:.2f}%")
+    print(f"Both medications: {both_prevalence:.2f}%")
+    
+    # Analyze blood markers
+    # Get blood marker columns after renaming
+    blood_markers = [col for col in ['HEMOGLOBIN', 'HEMATOCRIT', 'PLATELETS', 'CRP', 'INR', 'PT', 'APTT'] 
+                    if col in analysis_data.columns]
+    
+    # Create detailed summaries by group
+    print("\nSummary statistics by medication group:")
+    for group in group_counts.index:
+        group_data = analysis_data[analysis_data['GROUP'] == group]
+        print(f"\n{group} group (n={len(group_data)}):")
+        for marker in blood_markers:
+            if marker in analysis_data.columns:
+                marker_stats = group_data[marker].describe()
+                print(f"{marker}: Mean={marker_stats['mean']:.2f}, SD={marker_stats['std']:.2f}, "
+                     f"Min={marker_stats['min']:.2f}, Max={marker_stats['max']:.2f}")
+    
+    # Create visualizations for each blood marker
+    for marker in blood_markers:
+        if marker in analysis_data.columns:
+            # Box plot
+            plt.figure(figsize=(10, 6))
+            sns.boxplot(x='GROUP', y=marker, data=analysis_data, palette='viridis')
+            plt.title(f'{marker} by Medication Group')
+            plt.xlabel('Medication Group')
+            plt.ylabel(marker)
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            plt.savefig(f'{marker}_by_group_boxplot.png')
+            print(f"Created boxplot for {marker} (saved as {marker}_by_group_boxplot.png)")
+            
+            # Histograms by group
+            plt.figure(figsize=(12, 8))
+            for i, group in enumerate(group_counts.index):
+                plt.subplot(2, 2, i+1)
+                group_data = analysis_data[analysis_data['GROUP'] == group]
+                sns.histplot(group_data[marker].dropna(), kde=True)
+                plt.title(f'{marker} Distribution - {group}')
+                plt.xlabel(marker)
+                plt.ylabel('Count')
+            plt.tight_layout()
+            plt.savefig(f'{marker}_distribution_by_group.png')
+            print(f"Created distribution plots for {marker} (saved as {marker}_distribution_by_group.png)")
+            
+            # ANOVA to test for significant differences
+            groups = [analysis_data[analysis_data['GROUP'] == group][marker].dropna() 
+                     for group in group_counts.index]
+            # Make sure we have data in each group
+            if all(len(g) > 0 for g in groups):
+                f_stat, p_val = stats.f_oneway(*groups)
+                print(f"\nANOVA for {marker}:")
+                print(f"F-statistic: {f_stat:.4f}, p-value: {p_val:.4f}")
+                
+                if p_val < 0.05:
+                    print(f"Significant difference found in {marker} levels between groups")
+                    
+                    # Post-hoc t-tests to identify which groups differ
+                    print("Post-hoc t-tests:")
+                    group_list = list(group_counts.index)
+                    for i in range(len(group_list)):
+                        for j in range(i+1, len(group_list)):
+                            group1 = group_list[i]
+                            group2 = group_list[j]
+                            group1_data = analysis_data[analysis_data['GROUP'] == group1][marker].dropna()
+                            group2_data = analysis_data[analysis_data['GROUP'] == group2][marker].dropna()
+                            if len(group1_data) > 0 and len(group2_data) > 0:
+                                t_stat, p_val_t = stats.ttest_ind(
+                                    group1_data,
+                                    group2_data,
+                                    equal_var=False
+                                )
+                                print(f"{group1} vs {group2}: t-stat={t_stat:.4f}, p-value={p_val_t:.4f}")
+            else:
+                print(f"Warning: Insufficient data for ANOVA on {marker}")
+    
+    # Step 5: Regression analysis (if we have enough data and columns)
+    age_col = rename_dict.get('RIDAGEYR', 'AGE')
+    
+    print("\nStep 5: Conducting regression analysis...")
+    
+    # Check if we have INR or other coagulation markers
+    coag_markers_present = [marker for marker in ['INR', 'PT', 'APTT'] if marker in analysis_data.columns]
+    
+    if coag_markers_present:
+        print(f"Running regression models for coagulation markers: {coag_markers_present}")
+        
+        # OLS regression models for each coagulation marker
+        for marker in coag_markers_present:
+            # Create model formula with interaction term
+            formula = f"{marker} ~ ANTACID_FLAG + ANTICOAG_FLAG + ANTACID_FLAG:ANTICOAG_FLAG"
+            
+            # Add age if available
+            if age_col in analysis_data.columns:
+                formula += f" + {age_col}"
+            
+            # Add gender and race variables to formula if available
+            gender_cols = [col for col in analysis_data.columns if gender_col in col and col != gender_col]
+            race_cols = [col for col in analysis_data.columns if race_col in col and col != race_col]
+            
+            for col in gender_cols + race_cols:
+                formula += f" + {col}"
+            
+            try:
+                # Fit the model
+                model = ols(formula, data=analysis_data).fit()
+                
+                # Print summary
+                print(f"\nRegression results for {marker}:")
+                print(model.summary().tables[1])
+                
+                # Check for interaction effect
+                if 'ANTACID_FLAG:ANTICOAG_FLAG' in model.params:
+                    interaction_pval = model.pvalues.get('ANTACID_FLAG:ANTICOAG_FLAG')
+                    interaction_coef = model.params.get('ANTACID_FLAG:ANTICOAG_FLAG')
+                    
+                    if interaction_pval and interaction_pval < 0.05:
+                        print(f"Significant interaction effect found for {marker}:")
+                        print(f"Coefficient: {interaction_coef:.4f}, p-value: {interaction_pval:.4f}")
+                        print("This suggests antacids may alter anticoagulant effectiveness.")
+                    else:
+                        print(f"No significant interaction effect for {marker} (p={interaction_pval:.4f})")
+                else:
+                    print("Interaction term not in model")
+                    
+                # Create prediction grid for visualization
+                if age_col in analysis_data.columns:
+                    mean_age = analysis_data[age_col].mean()
+                    pred_data = pd.DataFrame({
+                        'ANTACID_FLAG': [False, False, True, True],
+                        'ANTICOAG_FLAG': [False, True, False, True],
+                        age_col: [mean_age, mean_age, mean_age, mean_age]
+                    })
+                    
+                    # Add dummy columns for categorical variables
+                    for col in gender_cols + race_cols:
+                        pred_data[col] = analysis_data[col].mode()[0]
+                    
+                    # Get predictions
+                    pred_data['predicted'] = model.predict(pred_data)
+                    
+                    # Create visualization
+                    plt.figure(figsize=(10, 6))
+                    sns.barplot(x='ANTICOAG_FLAG', y='predicted', hue='ANTACID_FLAG', data=pred_data)
+                    plt.title(f'Predicted {marker} by Medication Use')
+                    plt.xlabel('Anticoagulant Use')
+                    plt.ylabel(f'Predicted {marker}')
+                    plt.xticks([0, 1], ['No', 'Yes'])
+                    plt.legend(title='Antacid Use', labels=['No', 'Yes'])
+                    plt.tight_layout()
+                    plt.savefig(f'{marker}_prediction.png')
+                    print(f"Created prediction plot for {marker} (saved as {marker}_prediction.png)")
+            except Exception as e:
+                print(f"Error in regression for {marker}: {e}")
+    else:
+        print("No coagulation markers (INR, PT, APTT) found in dataset. Using other blood markers instead.")
+        
+        # If no coagulation markers, use general blood markers
+        for marker in ['PLATELETS', 'HEMOGLOBIN', 'HEMATOCRIT']:
+            if marker in analysis_data.columns:
+                try:
+                    # Create formula
+                    formula = f"{marker} ~ ANTACID_FLAG + ANTICOAG_FLAG + ANTACID_FLAG:ANTICOAG_FLAG"
+                    if age_col in analysis_data.columns:
+                        formula += f" + {age_col}"
+                    
+                    # Add gender and race variables to formula if available
+                    gender_cols = [col for col in analysis_data.columns if gender_col in col and col != gender_col]
+                    race_cols = [col for col in analysis_data.columns if race_col in col and col != race_col]
+                    
+                    for col in gender_cols + race_cols:
+                        formula += f" + {col}"
+                    
+                    # Fit model
+                    model = ols(formula, data=analysis_data).fit()
+                    print(f"\nRegression results for {marker} (proxy for coagulation):")
+                    print(model.summary().tables[1])
+                    
+                    # Check interaction term
+                    if 'ANTACID_FLAG:ANTICOAG_FLAG' in model.params:
+                        interaction_pval = model.pvalues.get('ANTACID_FLAG:ANTICOAG_FLAG')
+                        interaction_coef = model.params.get('ANTACID_FLAG:ANTICOAG_FLAG')
+                        
+                        if interaction_pval and interaction_pval < 0.05:
+                            print(f"Significant interaction effect found for {marker}:")
+                            print(f"Coefficient: {interaction_coef:.4f}, p-value: {interaction_pval:.4f}")
+                        else:
+                            print(f"No significant interaction effect for {marker} (p={interaction_pval:.4f})")
+                except Exception as e:
+                    print(f"Error in regression for {marker}: {e}")
+    
+    # Enhanced Step 3: Data Analysis & Statistical Tests
+    print("\nStep 3 (Enhanced): Advanced Data Analysis & Statistical Tests...")
+    
+    # Additional detailed statistical analysis on coagulation markers
+    if coag_markers_present:
+        # Create interaction variable
+        analysis_data['INTERACTION'] = analysis_data['ANTACID_FLAG'] & analysis_data['ANTICOAG_FLAG']
+        
+        # Chi-square test for association between antacid use and abnormal coagulation
+        for marker in coag_markers_present:
+            # Define normal ranges (approximate ranges - should be adjusted based on lab standards)
+            if 'INR' in marker:
+                analysis_data['ABNORMAL'] = (analysis_data[marker] < 0.8) | (analysis_data[marker] > 1.2)
+                normal_range = "0.8-1.2"
+            elif 'PT' in marker:
+                analysis_data['ABNORMAL'] = (analysis_data[marker] < 11) | (analysis_data[marker] > 13.5)
+                normal_range = "11-13.5 seconds"
+            elif 'APTT' in marker or 'PTT' in marker:
+                analysis_data['ABNORMAL'] = (analysis_data[marker] < 25) | (analysis_data[marker] > 35)
+                normal_range = "25-35 seconds"
+            else:
+                continue
+                
+            # Run chi-square test
+            crosstab = pd.crosstab(
+                analysis_data['GROUP'], 
+                analysis_data['ABNORMAL']
+            )
+            chi2, p, dof, expected = stats.chi2_contingency(crosstab)
+            
+            print(f"\nAssociation between medication groups and abnormal {marker} (normal range: {normal_range}):")
+            print(f"Chi-square: {chi2:.4f}, p-value: {p:.4f}")
+            print("Contingency table:")
+            print(crosstab)
+            
+            # Calculate odds ratios for abnormal values in each group compared to 'Neither' group
+            odds_ratios = {}
+            reference_group = 'Neither'
+            
+            for group in [g for g in group_counts.index if g != reference_group]:
+                # Create 2x2 contingency table for this comparison
+                group_data = analysis_data[analysis_data['GROUP'].isin([reference_group, group])]
+                table = pd.crosstab(group_data['GROUP'] == group, group_data['ABNORMAL'])
+                
+                try:
+                    # Calculate odds ratio
+                    odds_ratio = (table.iloc[1, 1] * table.iloc[0, 0]) / (table.iloc[1, 0] * table.iloc[0, 1])
+                    
+                    # Fisher's exact test
+                    _, p_fisher = stats.fisher_exact(table)
+                    
+                    odds_ratios[group] = {
+                        'odds_ratio': odds_ratio,
+                        'p_value': p_fisher
+                    }
+                except Exception as e:
+                    print(f"Could not calculate odds ratio for {group}: {e}")
+            
+            print("\nOdds ratios for abnormal values (compared to 'Neither' group):")
+            for group, stats_dict in odds_ratios.items():
+                print(f"{group}: OR={stats_dict['odds_ratio']:.2f}, p={stats_dict['p_value']:.4f}")
+    
+    # Create more comprehensive box plots for INR/PT/aPTT across medication groups
+    for marker in coag_markers_present:
+        plt.figure(figsize=(12, 7))
+        ax = sns.boxplot(x='GROUP', y=marker, data=analysis_data, palette='viridis')
+        
+        # Add individual data points
+        sns.stripplot(x='GROUP', y=marker, data=analysis_data, 
+                    size=4, color='.3', linewidth=0, alpha=0.4)
+        
+        # Add median lines
+        medians = analysis_data.groupby('GROUP')[marker].median()
+        vertical_offset = analysis_data[marker].median() * 0.05
+        
+        for xtick in range(len(ax.get_xticks())):
+            if xtick < len(medians):
+                ax.text(xtick, medians.iloc[xtick] + vertical_offset, 
+                     f'Median: {medians.iloc[xtick]:.2f}', 
+                     horizontalalignment='center',
+                     color='black', fontweight='bold')
+        
+        plt.title(f'Distribution of {marker} by Medication Group', fontsize=14)
+        plt.xlabel('Medication Group', fontsize=12)
+        plt.ylabel(marker, fontsize=12)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(f'{marker}_enhanced_boxplot.png')
+        print(f"Created enhanced boxplot for {marker} (saved as {marker}_enhanced_boxplot.png)")
+    
+    # Step 6: Interpretation & Conclusion (NEW)
+    print("\nStep 6: Interpretation & Conclusion...")
+    
+    # Evaluate results and interpret findings
+    print("\nSummary of Findings:")
+    
+    # Prevalence analysis
+    print(f"1. Medication Use Prevalence:")
+    print(f"   - Antacid use: {antacid_prevalence:.2f}%")
+    print(f"   - Anticoagulant use: {anticoag_prevalence:.2f}%")
+    print(f"   - Both medications: {both_prevalence:.2f}%")
+    
+    # Chi-square test results
+    if 'chi2' in locals() and 'p' in locals():
+        print(f"2. Association between antacid and anticoagulant use:")
+        if p < 0.05:
+            print(f"   - Significant association found (chi-square={chi2:.4f}, p={p:.4f})")
+            if 'odds_ratios' in locals():
+                for group, stats_dict in odds_ratios.items():
+                    if stats_dict['p_value'] < 0.05:
+                        if stats_dict['odds_ratio'] > 1:
+                            print(f"   - {group} group had {stats_dict['odds_ratio']:.2f} times higher odds of abnormal values")
+                        else:
+                            print(f"   - {group} group had {1/stats_dict['odds_ratio']:.2f} times lower odds of abnormal values")
+        else:
+            print(f"   - No significant association found (chi-square={chi2:.4f}, p={p:.4f})")
+    
+    # Regression results
+    sig_models = []
+    if coag_markers_present:
+        print(f"3. Regression Analysis Results:")
+        for marker in coag_markers_present:
+            if 'model' in locals():
+                if 'ANTACID_FLAG:ANTICOAG_FLAG' in model.params:
+                    interaction_pval = model.pvalues.get('ANTACID_FLAG:ANTICOAG_FLAG')
+                    interaction_coef = model.params.get('ANTACID_FLAG:ANTICOAG_FLAG')
+                    
+                    if interaction_pval and interaction_pval < 0.05:
+                        direction = "increase" if interaction_coef > 0 else "decrease"
+                        sig_models.append((marker, interaction_coef, interaction_pval))
+                        print(f"   - Significant interaction effect on {marker}:")
+                        print(f"     Taking both medications associated with {direction} of {abs(interaction_coef):.4f} units")
+                        print(f"     (p={interaction_pval:.4f})")
+                    else:
+                        print(f"   - No significant interaction effect on {marker} (p={interaction_pval:.4f})")
+    else:
+        print("   - No coagulation markers available for regression analysis")
+    
+    # ANOVA results
+    sig_anova = []
+    if 'f_stat' in locals() and 'p_val' in locals():
+        for marker in blood_markers:
+            if marker in analysis_data.columns:
+                if p_val < 0.05:
+                    sig_anova.append((marker, f_stat, p_val))
+                    print(f"   - Significant differences in {marker} across medication groups (F={f_stat:.4f}, p={p_val:.4f})")
+    
+    # Overall interpretation
+    print("\nOverall Interpretation:")
+    if sig_models or sig_anova:
+        print("Based on the analysis, there is evidence suggesting that concurrent use of antacids")
+        print("and anticoagulants may have clinically significant interactions.")
+        
+        if sig_models:
+            for marker, coef, p_val in sig_models:
+                direction = "increase" if coef > 0 else "decrease"
+                print(f"- Concurrent use was associated with a {direction} in {marker} (p={p_val:.4f})")
+                if 'INR' in marker and coef < 0:
+                    print("  This suggests antacids may reduce anticoagulant effectiveness.")
+                elif 'INR' in marker and coef > 0:
+                    print("  This suggests antacids may enhance anticoagulant effect, potentially increasing bleeding risk.")
+    else:
+        print("Based on the available data, there is insufficient evidence to conclude that")
+        print("antacids significantly alter anticoagulant efficacy.")
+    
+    # Clinical relevance
+    print("\nClinical Relevance:")
+    print("- This analysis used real-world NHANES data reflecting medication use in the general population")
+    print("- Findings may help inform clinical practice regarding potential interactions")
+    
+    # Limitations
+    print("\nLimitations:")
+    print("- Cross-sectional design limits causal inference")
+    print("- NHANES may not capture all variables affecting coagulation")
+    print("- Self-reported medication use may not reflect actual adherence")
+    print("- Specific dosages of medications are not available in the dataset")
+    
+    # Recommendations
+    print("\nRecommendations:")
+    print("- Healthcare providers should monitor coagulation markers closely in patients taking both medications")
+    print("- Consider timing separation between antacid and anticoagulant administration")
+    print("- Future research should include prospective studies with direct measurement of drug levels")
+    
+    # Save final analysis dataset
+    analysis_data.to_csv('antacid_anticoagulant_analysis_results.csv', index=False)
+    print("\nAnalysis complete. Results saved to 'antacid_anticoagulant_analysis_results.csv'")
+
+    # Create comprehensive summary figure
+    if coag_markers_present:
+        plt.figure(figsize=(15, 10))
+        
+        # First plot: Participant distribution
+        plt.subplot(2, 2, 1)
+        sns.countplot(x='GROUP', data=analysis_data, palette='viridis')
+        plt.title('Distribution of Participants by Medication Use')
+        plt.xlabel('Medication Group')
+        plt.ylabel('Count')
+        plt.xticks(rotation=45)
+        
+        # Second plot: Coagulation marker by group (first available marker)
+        marker = coag_markers_present[0]
+        plt.subplot(2, 2, 2)
+        sns.boxplot(x='GROUP', y=marker, data=analysis_data, palette='viridis')
+        plt.title(f'{marker} by Medication Group')
+        plt.xlabel('Medication Group')
+        plt.ylabel(marker)
+        plt.xticks(rotation=45)
+        
+        # Third plot: Abnormal values proportion
+        plt.subplot(2, 2, 3)
+        abnormal_props = analysis_data.groupby('GROUP')['ABNORMAL'].mean() * 100
+        abnormal_props.plot(kind='bar', color='viridis')
+        plt.title('Percentage of Abnormal Values by Group')
+        plt.xlabel('Medication Group')
+        plt.ylabel('Percent Abnormal (%)')
+        plt.xticks(rotation=45)
+        
+        # Fourth plot: Interaction effect visualization if significant
+        plt.subplot(2, 2, 4)
+        if sig_models:
+            marker, coef, p_val = sig_models[0]
+            # Create interaction plot
+            if 'pred_data' in locals():
+                sns.barplot(x='ANTICOAG_FLAG', y='predicted', hue='ANTACID_FLAG', data=pred_data)
+                plt.title(f'Interaction Effect on {marker}\n(p={p_val:.4f})')
+                plt.xlabel('Anticoagulant Use')
+                plt.ylabel(f'Predicted {marker}')
+                plt.xticks([0, 1], ['No', 'Yes'])
+                plt.legend(title='Antacid Use', labels=['No', 'Yes'])
+            else:
+                plt.text(0.5, 0.5, "Insufficient data for\ninteraction visualization", 
+                        ha='center', va='center', fontsize=12)
+                plt.axis('off')
+        else:
+            plt.text(0.5, 0.5, "No significant interaction\neffects detected", 
+                    ha='center', va='center', fontsize=12)
+            plt.axis('off')
+        
+        plt.tight_layout()
+        plt.savefig('summary_figure.png')
+        print("Created comprehensive summary figure (saved as summary_figure.png)")
+
+def main():
+    # Define medication classes
+    antacids = [
+        'OMEPRAZOLE', 'PANTOPRAZOLE', 'ESOMEPRAZOLE', 'LANSOPRAZOLE', 'RABEPRAZOLE',  # PPIs
+        'RANITIDINE', 'FAMOTIDINE', 'CIMETIDINE', 'NIZATIDINE',  # H2 blockers
+        'ALUMINUM HYDROXIDE', 'MAGNESIUM HYDROXIDE', 'CALCIUM CARBONATE',  # Antacids
+        'NEXIUM', 'PRILOSEC', 'PREVACID', 'PROTONIX', 'ACIPHEX', 'ZANTAC', 'PEPCID', 'TAGAMET',
+        'MAALOX', 'MYLANTA', 'TUMS', 'ROLAIDS'
+    ]
+    
+    anticoagulants = [
+        'WARFARIN', 'COUMADIN', 'JANTOVEN',  # Vitamin K antagonists
+        'DABIGATRAN', 'PRADAXA',  # Direct thrombin inhibitors
+        'RIVAROXABAN', 'XARELTO', 'APIXABAN', 'ELIQUIS', 'EDOXABAN', 'SAVAYSA',  # Factor Xa inhibitors
+        'HEPARIN', 'LOVENOX', 'ENOXAPARIN', 'FRAGMIN', 'DALTEPARIN'  # Heparins
+    ]
+    
+    # Load and process all specified NHANES files
+    try:
+        # Process NHANES data files to examine antacid-anticoagulant interaction
+        print("Loading NHANES data files...")
+        
+        # RX data (prescriptions)
+        try:
+            rx_data = pd.read_sas('RXQ_RX_L.xpt')
+            print(f"Loaded prescription data: {rx_data.shape[0]} records")
+        except Exception as e:
+            print(f"Error loading RXQ_RX_L.xpt: {e}")
+            rx_data = None
+        
+        # Alternative medication data
+        try:
+            med_data = pd.read_sas('MCQ_L.xpt')
+            print(f"Loaded medication questionnaire data: {med_data.shape[0]} records")
+            # If rx_data is None, create a simplified version from med_data
+            if rx_data is None:
+                rx_data = med_data.copy()
+                print("Using medication questionnaire data as fallback for prescription data")
+        except Exception as e:
+            print(f"Error loading MCQ_L.xpt: {e}")
+            med_data = None
+            
+        # Ensure we have prescription data
+        if rx_data is None:
+            print("Critical error: No prescription data available. Exiting.")
+            return
+            
+        # Demographics
+        try:
+            demo_data = pd.read_sas('DEMO_L.xpt')
+            print(f"Loaded demographic data: {demo_data.shape[0]} records")
+        except Exception as e:
+            print(f"Error loading DEMO_L.xpt: {e}")
+            print("Demographic data is required. Exiting.")
+            return
+            
+        # CBC (Complete Blood Count)
+        try:
+            cbc_data = pd.read_sas('CBC_L.xpt')
+            print(f"Loaded CBC data: {cbc_data.shape[0]} records")
+        except Exception as e:
+            print(f"Error loading CBC_L.xpt: {e}")
+            print("CBC data is required. Exiting.")
+            return
+            
+        # CRP (C-reactive protein)
+        try:
+            crp_data = pd.read_sas('HSCRP_L.xpt')
+            print(f"Loaded CRP data: {crp_data.shape[0]} records")
+        except Exception as e:
+            print(f"Error loading HSCRP_L.xpt: {e}")
+            # Create a minimal CRP dataset if not available
+            print("Creating minimal CRP data from demo data")
+            crp_data = demo_data[['SEQN']].copy()
+            crp_data['LBXSCRP'] = np.nan
+        
+        # Additional datasets that are helpful but not critical
+        # Diet data
+        try:
+            diet_data = pd.read_sas('DBQ_L.xpt')
+            print(f"Loaded diet data: {diet_data.shape[0]} records")
+        except Exception as e:
+            print(f"Note: Diet data not loaded: {e}")
+            diet_data = None
+            
+        # HDL cholesterol
+        try:
+            hdl_data = pd.read_sas('hdl_L.xpt')
+            print(f"Loaded HDL data: {hdl_data.shape[0]} records")
+        except Exception as e:
+            print(f"Note: HDL data not loaded: {e}")
+            hdl_data = None
+            
+        # Ferritin
+        try:
+            ferritin_data = pd.read_sas('fertin_l.xpt')
+            print(f"Loaded ferritin data: {ferritin_data.shape[0]} records")
+        except Exception as e:
+            print(f"Note: Ferritin data not loaded: {e}")
+            ferritin_data = None
+            
+        # RBC folate
+        try:
+            rbc_folate_data = pd.read_sas('folate_l.xpt')
+            print(f"Loaded RBC folate data: {rbc_folate_data.shape[0]} records")
+        except Exception as e:
+            print(f"Note: RBC folate data not loaded: {e}")
+            rbc_folate_data = None
+            
+        # Vitamin D
+        try:
+            vit_d_data = pd.read_sas('VID_L.xpt')
+            print(f"Loaded vitamin D data: {vit_d_data.shape[0]} records")
+        except Exception as e:
+            print(f"Note: Vitamin D data not loaded: {e}")
+            vit_d_data = None
+            
+        # Serum folate forms
+        try:
+            folate_forms_data = pd.read_sas('FOLFMS_L.xpt')
+            print(f"Loaded serum folate forms data: {folate_forms_data.shape[0]} records")
+        except Exception as e:
+            print(f"Note: Serum folate forms data not loaded: {e}")
+            folate_forms_data = None
+        
+        # Call the analysis function with all datasets
+        analyze_nhanes_data(rx_data, demo_data, cbc_data, crp_data, antacids, anticoagulants,
+                          diet_data, hdl_data, ferritin_data, rbc_folate_data, vit_d_data, folate_forms_data)
+                          
+    except Exception as e:
+        print(f"Unexpected error in main function: {e}")
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
+
